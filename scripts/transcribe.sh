@@ -12,6 +12,8 @@ set -e
 
 # ~/.local/bin 常用于放静态版 ffmpeg/ffprobe（macOS 上 brew 不可用时），自动纳入 PATH
 export PATH="$HOME/.local/bin:$PATH"
+# 强制 UTF-8 locale，否则 wc -m 等会报 "Illegal byte sequence"（无条件覆盖，防止继承到 C）
+export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 
 # 依赖检查：缺哪个直接报清楚，别等到中途才失败
 MISSING=""
@@ -48,7 +50,10 @@ GROQ_API_KEY="${GROQ_API_KEY:?请先设置环境变量：export GROQ_API_KEY=gsk
 
 # Groq API 限制: 25MB per file
 MAX_CHUNK_SIZE_MB=20
-AUDIO_BITRATE="64k"
+# Whisper 内部按 16kHz 处理，故压到 16kHz/单声道/32k 即可：文件更小、上传与转录都更快，
+# 能显著降低 Groq 返回 524（处理超时）的概率。
+AUDIO_RATE="16000"
+AUDIO_BITRATE="32k"
 SEGMENT_SECONDS=600   # 每段 10 分钟，避免单段过长导致 Whisper 524 超时
 
 cleanup() { rm -rf "$TMPDIR"; }
@@ -76,7 +81,7 @@ echo "🔗 音频: $AUDIO_URL"
 echo "⬇️  正在下载音频..."
 EXT="${AUDIO_URL##*.}"
 EXT="${EXT%%\?*}"   # 去掉可能的 query string
-curl -sL -A "Mozilla/5.0" -o "$TMPDIR/original.$EXT" "$AUDIO_URL"
+curl -fsL -A "Mozilla/5.0" --retry 5 --retry-delay 2 -C - -o "$TMPDIR/original.$EXT" "$AUDIO_URL"
 echo "📦 文件大小: $(ls -lh "$TMPDIR/original.$EXT" | awk '{print $5}')"
 
 # Step 3: 获取时长
@@ -88,7 +93,7 @@ echo "⏱️  时长: ${DURATION_MIN}分${DURATION_SEC}秒"
 
 # Step 4: 转为低码率单声道 MP3
 echo "🔄 正在转码..."
-ffmpeg -y -i "$TMPDIR/original.$EXT" -b:a "$AUDIO_BITRATE" -ac 1 "$TMPDIR/mono.mp3" 2>/dev/null
+ffmpeg -y -i "$TMPDIR/original.$EXT" -vn -ac 1 -ar "$AUDIO_RATE" -b:a "$AUDIO_BITRATE" "$TMPDIR/mono.mp3" 2>/dev/null
 MONO_SIZE=$(stat -f%z "$TMPDIR/mono.mp3" 2>/dev/null || stat -c%s "$TMPDIR/mono.mp3")
 echo "📦 转码后: $((MONO_SIZE / 1024 / 1024))MB"
 
@@ -102,8 +107,10 @@ if [ "$MONO_SIZE" -le "$MAX_BYTES" ] && [ "$DURATION" -le "$SEGMENT_SECONDS" ]; 
     echo "📎 无需切片"
 else
     echo "✂️  按每 $((SEGMENT_SECONDS / 60)) 分钟切片..."
+    # re-encode 切片（而非 -c copy），保证每段在切点处干净、可独立解码
     ffmpeg -y -loglevel error -i "$TMPDIR/mono.mp3" \
-        -f segment -segment_time "$SEGMENT_SECONDS" -c copy "$TMPDIR/chunk_%03d.mp3"
+        -f segment -segment_time "$SEGMENT_SECONDS" \
+        -ac 1 -ar "$AUDIO_RATE" -b:a "$AUDIO_BITRATE" "$TMPDIR/chunk_%03d.mp3"
     NUM_CHUNKS=$(ls "$TMPDIR"/chunk_*.mp3 2>/dev/null | wc -l | tr -d ' ')
     echo "   共 $NUM_CHUNKS 段"
 fi
@@ -111,17 +118,26 @@ fi
 CHUNKS=()
 while IFS= read -r f; do CHUNKS+=("$f"); done < <(ls "$TMPDIR"/chunk_*.mp3 | sort)
 
-# Whisper 在静音/音乐段常产生的幻觉噪声，转录后清洗掉
+# Whisper 在静音/音乐段常产生的幻觉噪声，转录后清洗掉。
+# 用 Python（UTF-8 安全；perl 字节模式会切坏中文多字节字符）。
+# 正则刻意"有界"，绝不用 [^。]* 这类贪婪跨度，避免误删正文。
 clean_transcript() {
-    perl -i -pe '
-        s/请不吝点赞[^。\n]*//g;
-        s/[^。\n]*订阅[^。\n]*转发[^。\n]*//g;
-        s/(这个)?字幕由[^。\n]*社区提供//g;
-        s/(本视频|本字幕)?由[^。\n]*Amara\.org[^。\n]*//gi;
-        s/请输出包含[^。\n]*的转写文本[。．]?//g;
-        s/[※★]+[^。\n]*//g;
-        s/感谢(大家)?(的)?(收看|观看|聆听)[，。]?//g;
-    ' "$1"
+    python3 - "$1" <<'PY'
+import re, sys
+p = sys.argv[1]
+t = open(p, encoding="utf-8", errors="replace").read()
+NOISE = [
+    r"[\s.，。、]*Amara\.org\s*社区提供",                 # 先清 Amara 字幕标记
+    r"(?:这个)?字幕由[\s\w.]{0,15}?社区提供",
+    r"请不吝点赞[\s，、,]*订阅[\s，、,]*转发[\s，、,]*打赏支持[^\n，。]{0,12}",
+    r"请输出包含[^\n]{0,40}?的转写文本[。．]?",
+    r"感谢(?:大家)?(?:的)?(?:收看|观看|聆听|收听|支持)[，。]?",
+    r"[※★]+",
+]
+for pat in NOISE:
+    t = re.sub(pat, "", t)
+open(p, "w", encoding="utf-8").write(t)
+PY
 }
 
 # Step 6: 调用 Groq Whisper API 转录
@@ -129,7 +145,7 @@ echo "🎙️  正在转录 (Groq Whisper large-v3)..."
 PROMPT="以下是一段中文普通话播客录音，请输出包含完整中文标点（，。？！：；""''）的转写文本。"
 
 transcribe_one() {
-    curl -s --max-time 300 -w "\n%{http_code}" \
+    curl -s --max-time 600 -w "\n%{http_code}" \
         https://api.groq.com/openai/v1/audio/transcriptions \
         -H "Authorization: Bearer $GROQ_API_KEY" \
         -F file="@$1" \
@@ -147,12 +163,13 @@ for chunk in "${CHUNKS[@]}"; do
     ATTEMPT=0
     while :; do
         ATTEMPT=$((ATTEMPT + 1))
-        RESPONSE=$(transcribe_one "$chunk")
-        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-        BODY=$(echo "$RESPONSE" | sed '$d')
+        # || true 防止 curl 超时/网络错误(exit!=0) 被 set -e 直接杀死，交给重试逻辑处理
+        RESPONSE=$(transcribe_one "$chunk") || true
+        HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+        BODY=$(printf '%s' "$RESPONSE" | sed '$d')
         [ "$HTTP_CODE" = "200" ] && break
-        if [ "$ATTEMPT" -ge 4 ]; then
-            echo "❌ API 错误 (HTTP $HTTP_CODE，已重试 $ATTEMPT 次)"; echo "$BODY"; exit 1
+        if [ "$ATTEMPT" -ge 5 ]; then
+            echo "❌ API 错误 (HTTP ${HTTP_CODE:-超时/网络}，已重试 $ATTEMPT 次)"; echo "$BODY"; exit 1
         fi
         if [ "$HTTP_CODE" = "429" ]; then
             WAIT_SEC=$(echo "$BODY" | perl -ne 'if (/in (\d+)m/) { print "$1\n"; exit }')
@@ -215,7 +232,7 @@ def polish(text, depth=0):
         return out
     mid = len(text) // 2
     return polish(text[:mid], depth + 1) + polish(text[mid:], depth + 1)
-content = open(IN, encoding="utf-8").read().strip()
+content = open(IN, encoding="utf-8", errors="replace").read().strip()
 open(OUT, "w", encoding="utf-8").write(polish(content) + "\n")
 print(f"✅ ({len(open(OUT, encoding='utf-8').read())} 字)")
 PY
