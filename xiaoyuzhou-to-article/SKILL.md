@@ -48,7 +48,7 @@ description: |
 ### Step 2: 运行转录脚本
 
 ```bash
-GROQ_API_KEY=$GROQ_API_KEY bash /Users/wangzhifeng/.claude/skills/xiaoyuzhou-to-article/scripts/transcribe.sh \
+GROQ_API_KEY=$GROQ_API_KEY bash ~/.claude/skills/xiaoyuzhou-to-article/scripts/transcribe.sh \
   --polish "<小宇宙链接>" "/tmp/podcast_transcript.md"
 ```
 
